@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-import image_processor, table_processor, text_processor
+from processors.pdf import image_processor, table_processor, text_processor
 
 
 def route_elements(pages: Iterable[dict]) -> None:

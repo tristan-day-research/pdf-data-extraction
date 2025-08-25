@@ -1,5 +1,5 @@
-from digital_element_classifier import DigitalElementClassifier
-from element_router import route_elements
+from classifiers.pdf import DigitalElementClassifier
+from routers.pdf import route_elements
 
 
 def test_route_elements_dispatches(monkeypatch):
@@ -14,9 +14,9 @@ def test_route_elements_dispatches(monkeypatch):
     def fake_image(image):
         calls["image"] += 1
 
-    monkeypatch.setattr("element_router.text_processor.process_text", fake_text)
-    monkeypatch.setattr("element_router.table_processor.process_table", fake_table)
-    monkeypatch.setattr("element_router.image_processor.process_image", fake_image)
+    monkeypatch.setattr("routers.pdf.element_router.text_processor.process_text", fake_text)
+    monkeypatch.setattr("routers.pdf.element_router.table_processor.process_table", fake_table)
+    monkeypatch.setattr("routers.pdf.element_router.image_processor.process_image", fake_image)
 
     classifier = DigitalElementClassifier()
     pages = classifier.classify('data/digital.pdf')
