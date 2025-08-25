@@ -1,0 +1,29 @@
+# PDF Data Extraction Project Dependencies
+
+# Core PDF processing libraries
+pdfminer.six>=20221105
+pdfplumber>=0.9.0
+
+# Testing framework
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Jupyter notebook support (for the demo notebook)
+jupyter>=1.0.0
+ipykernel>=6.0.0
+
+# Data processing and utilities
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Image processing (for future image extraction features)
+Pillow>=10.0.0
+
+# Type checking and development tools
+mypy>=1.0.0
+black>=23.0.0
+flake8>=6.0.0
+
+# Documentation
+sphinx>=7.0.0
+sphinx-rtd-theme>=1.3.0
