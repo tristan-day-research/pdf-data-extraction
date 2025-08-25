@@ -1,5 +1,5 @@
 import pytest
-from processors.pdf import process_text
+from extraction.processors.pdf import process_text
 
 
 def test_process_text_not_implemented():

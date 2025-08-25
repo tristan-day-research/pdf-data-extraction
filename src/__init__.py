@@ -1,25 +1,27 @@
-"""Top-level package for document data extraction utilities.
+"""
+PDF Data Extraction and Form Generation System
 
-The current implementation targets PDFs, but the project structure is designed
-to support additional file types in the future. The package exposes
-convenience functions for common operations.
+This package provides:
+- PDF data extraction capabilities
+- Form generation and filling via RAG
+- API endpoints for document processing
 """
 
-from .classifiers import DigitalElementClassifier, PdfTypeDetector
-from .routers import route_elements
+# Import extraction functionality
+from .extraction import (
+    PDFTypeDetector,
+    DigitalElementClassifier,
+    ElementRouter,
+)
 
-
-def classify(pdf_path: str):
-    """Classify elements in a digital PDF.
-
-    This is a convenience wrapper around :class:`DigitalElementClassifier`.
-    """
-    return DigitalElementClassifier().classify(pdf_path)
-
+# TODO: Import generation and API modules when implemented
+# from .generation import FormGenerator, RAGProcessor
+# from .api import DocumentProcessor, FormCompletionAPI
 
 __all__ = [
-    "classify",
-    "route_elements",
-    "DigitalElementClassifier",
-    "PdfTypeDetector",
+    # Extraction
+    'PDFTypeDetector',
+    'DigitalElementClassifier',
+    'ElementRouter',
+    # TODO: Add generation and API exports when implemented
 ]

@@ -1,5 +1,5 @@
 import pytest
-from processors.pdf import process_image
+from extraction.processors.pdf import process_image
 
 
 def test_process_image_not_implemented():

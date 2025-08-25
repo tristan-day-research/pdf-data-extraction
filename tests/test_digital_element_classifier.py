@@ -1,4 +1,4 @@
-from classifiers.pdf import DigitalElementClassifier
+from extraction.classifiers.pdf import DigitalElementClassifier
 
 
 def test_classify_detects_text():
