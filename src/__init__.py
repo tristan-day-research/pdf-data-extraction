@@ -2,8 +2,8 @@
 
 Provides convenience functions for common operations."""
 
-from .digital_element_classifier import DigitalElementClassifier
-from .element_router import route_elements
+from digital_element_classifier import DigitalElementClassifier
+from element_router import route_elements
 
 
 def classify(pdf_path: str):
