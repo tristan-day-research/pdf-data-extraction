@@ -1,9 +1,12 @@
-"""Top-level package for PDF data extraction utilities.
+"""Top-level package for document data extraction utilities.
 
-Provides convenience functions for common operations."""
+The current implementation targets PDFs, but the project structure is designed
+to support additional file types in the future. The package exposes
+convenience functions for common operations.
+"""
 
-from .digital_element_classifier import DigitalElementClassifier
-from .element_router import route_elements
+from .classifiers import DigitalElementClassifier, PdfTypeDetector
+from .routers import route_elements
 
 
 def classify(pdf_path: str):
@@ -14,4 +17,9 @@ def classify(pdf_path: str):
     return DigitalElementClassifier().classify(pdf_path)
 
 
-__all__ = ["classify", "route_elements", "DigitalElementClassifier"]
+__all__ = [
+    "classify",
+    "route_elements",
+    "DigitalElementClassifier",
+    "PdfTypeDetector",
+]

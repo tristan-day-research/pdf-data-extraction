@@ -1,5 +1,5 @@
 import pytest
-from table_processor import process_table
+from processors.pdf import process_table
 
 
 def test_process_table_not_implemented():

@@ -1,4 +1,4 @@
-from pdf_type_detector import PdfTypeDetector
+from classifiers.pdf import PdfTypeDetector
 
 
 def test_detect_digital_pdf():
