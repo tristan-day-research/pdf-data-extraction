@@ -1,5 +1,5 @@
 import pytest
-from processors.pdf import process_table
+from extraction.processors.pdf import process_table
 
 
 def test_process_table_not_implemented():

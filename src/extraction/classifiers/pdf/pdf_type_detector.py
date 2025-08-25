@@ -17,7 +17,7 @@ PdfType = Literal["digital", "scanned"]
 
 
 @dataclass
-class PdfTypeDetector:
+class PDFTypeDetector:
     """Detect whether a PDF is digital or scanned."""
 
     sample_pages: int = 1
