@@ -544,7 +544,7 @@ def _stitch_tables_across_pages(tables_by_page: Dict[int, List[ElementDict]],
 # Public API
 # -----------------------------
 @dataclass
-class PDFDigitalElementClassifier:
+class PDFDigitalJournalElementClassifier:
 
     def classify(self, pdf_path: str, document_id: str = None) -> ElementType:
         """
