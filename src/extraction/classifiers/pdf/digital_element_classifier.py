@@ -169,14 +169,15 @@ def _detect_table_regions(pdf_path: str) -> Dict[int, List[ElementDict]]:
 # -----------------------------
 # Image detection (raster XObjects)
 # -----------------------------
-def _detect_images(pdf_path: str, save_images: bool = True, output_dir: str = None) -> Dict[int, List[ElementDict]]:
+def _detect_images(pdf_path: str, save_images: bool = True, document_id: str = None, output_dir: str = None) -> Dict[int, List[ElementDict]]:
     """
     Detect and optionally save images from PDF.
     
     Args:
         pdf_path: Path to PDF file
         save_images: Whether to extract and save images
-        output_dir: Directory to save images (defaults to same directory as PDF)
+        document_id: Document ID for organizing images in document structure
+        output_dir: Directory to save images (overrides document_id if provided)
     """
     import os
     from PIL import Image
@@ -184,12 +185,18 @@ def _detect_images(pdf_path: str, save_images: bool = True, output_dir: str = No
     
     imgs_by_page: Dict[int, List[ElementDict]] = {}
     
-    if save_images and output_dir is None:
-        # Default to same directory as PDF
-        output_dir = os.path.dirname(pdf_path)
-    
-    if save_images and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    if save_images:
+        if output_dir is None and document_id is not None:
+            # Use document structure - create it if it doesn't exist
+            from config import settings
+            settings.data.create_document_structure(document_id)
+            output_dir = settings.data.get_document_elements_path(document_id) / "images"
+        elif output_dir is None:
+            # If no document_id provided, don't save images to avoid cluttering source directory
+            save_images = False
+        
+        if save_images and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
     
     with pdfplumber.open(pdf_path) as pdf:
         for p, page in enumerate(pdf.pages):
@@ -536,16 +543,20 @@ def _stitch_tables_across_pages(tables_by_page: Dict[int, List[ElementDict]],
 @dataclass
 class DigitalElementClassifier:
 
-    def classify(self, pdf_path: str) -> ElementType:
+    def classify(self, pdf_path: str, document_id: str = None) -> ElementType:
         """
         Return a dictionary describing all element types in the PDF.
         Contains the keys ``text``, ``tables`` and ``images`` with metadata
         describing the location of each element. The goal is merely to
         identify their presence; detailed processing is delegated elsewhere.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            document_id: Optional document ID for organizing extracted data
         """
         # 1) Detect tables and images per page
         tables_by_page = _detect_table_regions(pdf_path)
-        images_by_page = _detect_images(pdf_path, save_images=True)
+        images_by_page = _detect_images(pdf_path, save_images=True, document_id=document_id)
 
         # Build occupied masks to avoid overlapping text classification
         occupied_masks: Dict[int, List[BBox]] = {}
@@ -603,3 +614,60 @@ class DigitalElementClassifier:
             "tables": all_tables,
             "images": all_images,
         }
+        """
+        Save extracted elements to the document's organized folder structure.
+        
+        Args:
+            document_id: Document identifier
+            elements: Dictionary containing text, tables, images, etc.
+        """
+        import json
+        from config import settings
+        
+        # Ensure document structure exists
+        settings.data.create_document_structure(document_id)
+        
+        # Get paths
+        elements_path = settings.data.get_document_elements_path(document_id)
+        
+        # Save text blocks
+        if 'text' in elements:
+            text_path = elements_path / "text_blocks.json"
+            with open(text_path, 'w') as f:
+                json.dump(elements['text'], f, indent=2)
+        
+        # Save tables
+        if 'tables' in elements:
+            tables_path = elements_path / "tables.json"
+            with open(tables_path, 'w') as f:
+                json.dump(elements['tables'], f, indent=2)
+        
+        # Save images metadata (images themselves are saved by _detect_images)
+        if 'images' in elements:
+            images_metadata = []
+            for img in elements['images']:
+                img_meta = {
+                    "id": img.get("id"),
+                    "bbox": img.get("bboxes_per_page", [{}])[0].get("bbox"),
+                    "page": img.get("page_range", [0])[0],
+                    "metadata": img.get("metadata", {})
+                }
+                images_metadata.append(img_meta)
+            
+            images_path = elements_path / "images_metadata.json"
+            with open(images_path, 'w') as f:
+                json.dump(images_metadata, f, indent=2)
+        
+        # Create basic metadata
+        metadata = {
+            "document_id": document_id,
+            "extracted_at": __import__('datetime').datetime.now().isoformat(),
+            "text_blocks": len(elements.get('text', [])),
+            "tables": len(elements.get('tables', [])),
+            "images": len(elements.get('images', [])),
+            "status": "elements_extracted"
+        }
+        
+        metadata_path = settings.data.get_document_index_path(document_id) / "metadata.json"
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
