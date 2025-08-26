@@ -8,12 +8,12 @@ This module contains all the components for extracting data from PDFs:
 - Routers: Element routing and processing coordination
 """
 
-from .classifiers.pdf.pdf_type_detector import PDFTypeDetector
-from .classifiers.pdf.digital_element_classifier import PDFDigitalElementClassifier
+from .classifiers.pdf.pdf_type_detector import PDFScannedOrDigitalDetector
+from .classifiers.pdf.pdf_digital_journal_element_classifier import PDFDigitalJournalElementClassifier
 from .routers.pdf.element_router import ElementRouter
 
 __all__ = [
-    'PDFTypeDetector',
-    'DigitalElementClassifier',
+    'PDFScannedOrDigitalDetector',
+    'PDFDigitalJournalElementClassifier',
     'ElementRouter',
 ]

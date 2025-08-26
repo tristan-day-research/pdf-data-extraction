@@ -5,6 +5,6 @@ structure allows future file types (e.g. CSV, DOCX) to provide their own
 classifiers without altering the public API.
 """
 
-from .pdf import PDFDigitalElementClassifier, PDFTypeDetector
+from .pdf import PDFDigitalJournalElementClassifier, PDFScannedOrDigitalDetector, PDFSandwichElementClassifier
 
-__all__ = ["PDFTypeDetector", "DigitalElementClassifier"]
+__all__ = ["PDFScannedOrDigitalDetector", "PDFDigitalJournalElementClassifier", "PDFSandwichElementClassifier"]
