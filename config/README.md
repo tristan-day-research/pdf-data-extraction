@@ -55,9 +55,34 @@ SECURITY__ENABLE_AUTH=true
 ## Configuration Sections
 
 ### DataSettings
-- File processing directories
+- Document-centric folder structure
+- Raw and processed data organization
 - Batch processing settings
 - Data retention policies
+- Helper methods for document paths
+
+## Document Structure
+
+The system uses a document-centric approach where each document gets its own folder:
+
+```
+data/
+└── documents/
+    ├── document1/
+    │   ├── raw/                    # Original PDF files
+    │   └── processed/              # Extracted and processed data
+    │       ├── elements/           # Raw extracted elements
+    │       ├── embeddings/         # Vector embeddings for RAG
+    │       └── index/              # Document indexing data
+    └── document2/
+```
+
+### Benefits
+- **Self-contained**: Each document is completely self-contained
+- **Easy cleanup**: Delete one folder = delete everything for that document
+- **Clear ownership**: All data for a document is in one place
+- **Better for RAG**: Each document folder can be treated as a unit
+- **Easier versioning**: Can version entire document folders
 
 ### APISettings
 - Server configuration

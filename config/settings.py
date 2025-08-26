@@ -1,35 +1,112 @@
-from __future__ import annotations
+# from __future__ import annotations
 
+# import os
+# from pathlib import Path
+# from typing import Optional, List, Dict, Any
+
+# from pydantic import Field, validator
+# from pydantic_settings import BaseSettings
+
+
+# class DataSettings(BaseSettings):
+#     """Settings for data processing and storage."""
+    
+#     # Data directories
+#     data_dir: Path = Field(default="data", description="Root data directory")
+#     documents_dir: Path = Field(default="data/documents", description="Directory containing document folders")
+#     temp_dir: Path = Field(default="temp", description="Directory for temporary files")
+    
+#     # Document structure
+#     raw_subdir: str = Field(default="raw", description="Subdirectory name for raw files")
+#     processed_subdir: str = Field(default="processed", description="Subdirectory name for processed data")
+#     elements_subdir: str = Field(default="elements", description="Subdirectory for extracted elements")
+#     embeddings_subdir: str = Field(default="embeddings", description="Subdirectory for vector embeddings")
+#     index_subdir: str = Field(default="index", description="Subdirectory for document indices")
+    
+#     # File processing settings
+#     max_file_size_mb: int = Field(default=100, description="Maximum PDF file size in MB")
+#     supported_formats: List[str] = Field(default=["pdf"], description="Supported file formats")
+#     batch_size: int = Field(default=10, description="Number of files to process in a batch")
+    
+from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-
-from pydantic import BaseSettings, Field, validator
-
+from pydantic import Field, validator
+from pydantic_settings import BaseSettings
 
 class DataSettings(BaseSettings):
     """Settings for data processing and storage."""
     
-    # Data directories
-    data_dir: Path = Field(default="data", description="Directory containing PDF files")
-    output_dir: Path = Field(default="output", description="Directory for extracted data output")
-    temp_dir: Path = Field(default="temp", description="Directory for temporary files")
+    # Get project root directory
+    project_root: Path = Path(__file__).parent.parent
+    
+    # Data directories (absolute paths from project root)
+    data_dir: Path = Field(default=project_root / "data", description="Root data directory")
+    documents_dir: Path = Field(default=project_root / "data/documents", description="Directory containing document folders")
+    temp_dir: Path = Field(default=project_root / "temp", description="Directory for temporary files")
+    
+    # Document structure
+    raw_subdir: str = Field(default="raw", description="Subdirectory name for raw files")
+    processed_subdir: str = Field(default="processed", description="Subdirectory name for processed data")
+    elements_subdir: str = Field(default="elements", description="Subdirectory for extracted elements")
+    embeddings_subdir: str = Field(default="embeddings", description="Subdirectory for vector embeddings")
+    index_subdir: str = Field(default="index", description="Subdirectory for document indices")
     
     # File processing settings
     max_file_size_mb: int = Field(default=100, description="Maximum PDF file size in MB")
     supported_formats: List[str] = Field(default=["pdf"], description="Supported file formats")
     batch_size: int = Field(default=10, description="Number of files to process in a batch")
-    
+
+
     # Data retention
     keep_temp_files: bool = Field(default=False, description="Whether to keep temporary files after processing")
     max_output_files: int = Field(default=1000, description="Maximum number of output files to keep")
     
-    @validator('data_dir', 'output_dir', 'temp_dir', pre=True)
+
+    
+    @validator('data_dir', 'documents_dir', 'temp_dir', pre=True)
     def create_directories(cls, v):
         """Create directories if they don't exist."""
         path = Path(v)
         path.mkdir(parents=True, exist_ok=True)
         return path
+    
+    def get_document_path(self, document_id: str) -> Path:
+        """Get the path to a specific document folder."""
+        return self.documents_dir / document_id
+    
+    def get_document_raw_path(self, document_id: str) -> Path:
+        """Get the path to raw files for a specific document."""
+        return self.get_document_path(document_id) / self.raw_subdir
+    
+    def get_document_processed_path(self, document_id: str) -> Path:
+        """Get the path to processed data for a specific document."""
+        return self.get_document_path(document_id) / self.processed_subdir
+    
+    def get_document_elements_path(self, document_id: str) -> Path:
+        """Get the path to extracted elements for a specific document."""
+        return self.get_document_processed_path(document_id) / self.elements_subdir
+    
+    def get_document_embeddings_path(self, document_id: str) -> Path:
+        """Get the path to embeddings for a specific document."""
+        return self.get_document_processed_path(document_id) / self.embeddings_subdir
+    
+    def get_document_index_path(self, document_id: str) -> Path:
+        """Get the path to index data for a specific document."""
+        return self.get_document_processed_path(document_id) / self.index_subdir
+    
+    def create_document_structure(self, document_id: str) -> None:
+        """Create the complete folder structure for a new document."""
+        paths = [
+            self.get_document_raw_path(document_id),
+            self.get_document_elements_path(document_id),
+            self.get_document_embeddings_path(document_id),
+            self.get_document_index_path(document_id)
+        ]
+        
+        for path in paths:
+            path.mkdir(parents=True, exist_ok=True)
 
 
 class APISettings(BaseSettings):
