@@ -84,6 +84,7 @@ def _detect_table_regions(pdf_path: str) -> Dict[int, List[ElementDict]]:
     tables_by_page: Dict[int, List[ElementDict]] = {}
 
     if _HAVE_CAMELOT:
+        print("_HAVE_CAMELOT ")
         # Camelot returns per-page tables; we call twice and merge.
         try:
             latt = camelot.read_pdf(pdf_path, pages="all", flavor="lattice", suppress_stdout=True)
@@ -130,6 +131,8 @@ def _detect_table_regions(pdf_path: str) -> Dict[int, List[ElementDict]]:
 
     # Fallback heuristic (when Camelot unavailable): dense numeric blocks with column alignment
     with pdfplumber.open(pdf_path) as pdf:
+
+        print("NO CAMELOT ")
         for p, page in enumerate(pdf.pages):
             words = page.extract_words(x_tolerance=2, y_tolerance=2, use_text_flow=True) or []
             if not words:
@@ -541,7 +544,7 @@ def _stitch_tables_across_pages(tables_by_page: Dict[int, List[ElementDict]],
 # Public API
 # -----------------------------
 @dataclass
-class DigitalElementClassifier:
+class PDFDigitalElementClassifier:
 
     def classify(self, pdf_path: str, document_id: str = None) -> ElementType:
         """
