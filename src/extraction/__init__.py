@@ -9,7 +9,7 @@ This module contains all the components for extracting data from PDFs:
 """
 
 from .classifiers.pdf.pdf_type_detector import PDFTypeDetector
-from .classifiers.pdf.digital_element_classifier import DigitalElementClassifier
+from .classifiers.pdf.digital_element_classifier import PDFDigitalElementClassifier
 from .routers.pdf.element_router import ElementRouter
 
 __all__ = [
