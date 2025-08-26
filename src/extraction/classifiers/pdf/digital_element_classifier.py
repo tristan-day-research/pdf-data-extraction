@@ -1,325 +1,605 @@
-"""Identification utilities for elements within digitally generated PDFs.
-
-The functions in this module categorise high-level page elements such as
-text blocks, tables and images. No processing of the extracted content is
-performed here; downstream modules should handle each element type
-separately.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Any
-import pdfplumber
-from pdfplumber.page import Page
+from typing import Any, Dict, List, Tuple, Optional, TypedDict
+import math
 
-ElementType = Dict[str, List]
+# ---- Optional external tools ----
+# - pdfplumber: required (geometry, words, images)
+# - camelot: optional (table regions via lattice/stream); code handles absence
+try:
+    import camelot  # type: ignore
+    _HAVE_CAMELOT = True
+except Exception:
+    _HAVE_CAMELOT = False
+
+import pdfplumber  # type: ignore
 
 
+# -----------------------------
+# Types
+# -----------------------------
+BBox = Tuple[float, float, float, float]  # (x0, y0, x1, y1) with PDF coordinates
+PageBBox = Dict[str, Any]  # {"page": int, "bbox": BBox}
+
+class ElementDict(TypedDict, total=False):
+    id: str
+    kind: str                  # "text" | "table" | "image"
+    page_range: Tuple[int, int]
+    bboxes_per_page: List[PageBBox]
+    metadata: Dict[str, Any]   # small, e.g., column_edges, header_signature
+    text: str                  # text content (for text elements)
+
+ElementType = Dict[str, List[ElementDict]]
+
+
+# -----------------------------
+# Utility geometry
+# -----------------------------
+def _iou(a: BBox, b: BBox) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    inter_w = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    inter_h = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = inter_w * inter_h
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, (ax1 - ax0)) * max(0.0, (ay1 - ay0))
+    area_b = max(0.0, (bx1 - bx0)) * max(0.0, (by1 - by0))
+    denom = area_a + area_b - inter
+    return inter / denom if denom > 0 else 0.0
+
+
+def _expand(b: BBox, px: float) -> BBox:
+    x0, y0, x1, y1 = b
+    return (x0 - px, y0 - px, x1 + px, y1 + px)
+
+
+def _nearly_equal(a: float, b: float, tol: float) -> bool:
+    return abs(a - b) <= tol
+
+
+def _horiz_overlap(a: BBox, b: BBox) -> float:
+    ax0, _, ax1, _ = a
+    bx0, _, bx1, _ = b
+    return max(0.0, min(ax1, bx1) - max(ax0, bx0))
+
+
+def _width(b: BBox) -> float:
+    return max(0.0, b[2] - b[0])
+
+
+def _height(b: BBox) -> float:
+    return max(0.0, b[3] - b[1])
+
+
+# -----------------------------
+# Table detection (regions only)
+# -----------------------------
+def _detect_table_regions(pdf_path: str) -> Dict[int, List[ElementDict]]:
+    """
+    Return {page_index: [table_element,...]} with bbox metadata only.
+    Tries Camelot (lattice + stream) if available; otherwise falls back to line/word density heuristic via pdfplumber.
+    """
+    tables_by_page: Dict[int, List[ElementDict]] = {}
+
+    if _HAVE_CAMELOT:
+        # Camelot returns per-page tables; we call twice and merge.
+        try:
+            latt = camelot.read_pdf(pdf_path, pages="all", flavor="lattice", suppress_stdout=True)
+        except Exception:
+            latt = []
+        try:
+            stre = camelot.read_pdf(pdf_path, pages="all", flavor="stream", suppress_stdout=True)
+        except Exception:
+            stre = []
+
+        def add_tbls(objs):
+            for t in getattr(objs, "tables", objs):
+                p = (t.page or 1) - 1
+                x0, y0, x1, y1 = t._bbox  # Camelot stores bbox in PDF coords (x0, y0, x1, y1)
+                # Normalize to (x0, y0, x1, y1) with origin at top-left per pdfplumber; Camelot already uses PDF coords
+                el: ElementDict = {
+                    "id": f"table_p{p}_{len(tables_by_page.get(p, []))}",
+                    "kind": "table",
+                    "page_range": (p, p),
+                    "bboxes_per_page": [{"page": p, "bbox": (x0, y0, x1, y1)}],
+                    "metadata": {
+                        "source": "camelot",
+                        "shape": getattr(t, "shape", None),
+                        "cols": getattr(t, "cols", None),
+                        "rows": getattr(t, "rows", None),
+                    },
+                }
+                tables_by_page.setdefault(p, []).append(el)
+
+        add_tbls(latt)
+        add_tbls(stre)
+
+        # De-duplicate overlapping detections (lattice vs stream)
+        for p, arr in tables_by_page.items():
+            keep: List[ElementDict] = []
+            for el in arr:
+                bb = el["bboxes_per_page"][0]["bbox"]
+                if any(_iou(bb, k["bboxes_per_page"][0]["bbox"]) > 0.6 for k in keep):
+                    continue
+                keep.append(el)
+            tables_by_page[p] = keep
+
+        return tables_by_page
+
+    # Fallback heuristic (when Camelot unavailable): dense numeric blocks with column alignment
+    with pdfplumber.open(pdf_path) as pdf:
+        for p, page in enumerate(pdf.pages):
+            words = page.extract_words(x_tolerance=2, y_tolerance=2, use_text_flow=True) or []
+            if not words:
+                continue
+            # Simple grid-ish grouping: bucket words into vertical bands (columns) then cluster dense y-bands
+            xs = sorted([(w["x0"], w["x1"]) for w in words], key=lambda t: t[0])
+            if not xs:
+                continue
+
+            # Build rough column edges via greedy merge
+            columns: List[List[Tuple[float, float]]] = []
+            for x0, x1 in xs:
+                if not columns or x0 - columns[-1][-1][1] > 8:  # gap threshold
+                    columns.append([(x0, x1)])
+                else:
+                    columns[-1].append((x0, x1))
+
+            # If we find ≥3 columns with many numeric tokens, mark a table region (very conservative)
+            numeric_words = [w for w in words if any(ch.isdigit() for ch in w["text"])]
+            if len(columns) >= 3 and len(numeric_words) >= 20:
+                # Compute bbox of dense area
+                x0 = min(w["x0"] for w in numeric_words)
+                x1 = max(w["x1"] for w in numeric_words)
+                y0 = min(w["top"] for w in numeric_words)
+                y1 = max(w["bottom"] for w in numeric_words)
+                el: ElementDict = {
+                    "id": f"table_p{p}_0",
+                    "kind": "table",
+                    "page_range": (p, p),
+                    "bboxes_per_page": [{"page": p, "bbox": (x0, y0, x1, y1)}],
+                    "metadata": {"source": "heuristic", "note": "low-confidence"},
+                }
+                tables_by_page.setdefault(p, []).append(el)
+    return tables_by_page
+
+
+# -----------------------------
+# Image detection (raster XObjects)
+# -----------------------------
+def _detect_images(pdf_path: str, save_images: bool = True, output_dir: str = None) -> Dict[int, List[ElementDict]]:
+    """
+    Detect and optionally save images from PDF.
+    
+    Args:
+        pdf_path: Path to PDF file
+        save_images: Whether to extract and save images
+        output_dir: Directory to save images (defaults to same directory as PDF)
+    """
+    import os
+    from PIL import Image
+    import io
+    
+    imgs_by_page: Dict[int, List[ElementDict]] = {}
+    
+    if save_images and output_dir is None:
+        # Default to same directory as PDF
+        output_dir = os.path.dirname(pdf_path)
+    
+    if save_images and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    with pdfplumber.open(pdf_path) as pdf:
+        for p, page in enumerate(pdf.pages):
+            # pdfplumber exposes raster images via page.images (x0, top, x1, bottom, width, height, ...)
+            for i, im in enumerate(page.images or []):
+                x0, x1 = im.get("x0"), im.get("x1")
+                top, bottom = im.get("top"), im.get("bottom")
+                if None in (x0, x1, top, bottom):
+                    continue
+                    
+                bbox: BBox = (float(x0), float(top), float(x1), float(bottom))
+                
+                # Extract image data
+                image_data = None
+                image_path = None
+                
+                if save_images and im.get("stream"):
+                    try:
+                        # Get image stream data
+                        stream_data = im["stream"].get_data()
+                        
+                        # Try to open with PIL to validate and get format
+                        img = Image.open(io.BytesIO(stream_data))
+                        
+                        # Generate filename
+                        pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
+                        img_filename = f"{pdf_name}_p{p}_img{i}.png"
+                        img_path = os.path.join(output_dir, img_filename)
+                        
+                        # Save image
+                        img.save(img_path)
+                        image_path = img_path
+                        image_data = {
+                            "format": img.format,
+                            "mode": img.mode,
+                            "size": img.size
+                        }
+                        
+                    except Exception as e:
+                        # If PIL fails, try to save raw stream data
+                        try:
+                            pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
+                            img_filename = f"{pdf_name}_p{p}_img{i}.raw"
+                            img_path = os.path.join(output_dir, img_filename)
+                            
+                            with open(img_path, 'wb') as f:
+                                f.write(stream_data)
+                            image_path = img_path
+                            image_data = {"note": "saved_as_raw_stream"}
+                            
+                        except Exception as e2:
+                            image_data = {"error": f"Failed to save: {str(e2)}"}
+                
+                el: ElementDict = {
+                    "id": f"image_p{p}_{i}",
+                    "kind": "image",
+                    "page_range": (p, p),
+                    "bboxes_per_page": [{"page": p, "bbox": bbox}],
+                    "metadata": {
+                        "width": float(im.get("width", _width(bbox))),
+                        "height": float(im.get("height", _height(bbox))),
+                        "name": im.get("name"),
+                        "stream": im.get("stream"),
+                        "image_path": image_path,  # Path to saved image file
+                        "image_data": image_data,  # Additional image metadata
+                    },
+                }
+                imgs_by_page.setdefault(p, []).append(el)
+    return imgs_by_page
+
+
+# -----------------------------
+# Text block detection
+# -----------------------------
+def _extract_all_text_blocks(pdf_path: str,
+                            occupied_masks: Dict[int, List[BBox]]) -> Dict[int, List[ElementDict]]:
+    """
+    Extract all text content from PDF, properly identifying text vs non-text elements.
+    Returns comprehensive text blocks with proper content and formatting metadata.
+    """
+    txt_by_page: Dict[int, List[ElementDict]] = {}
+    
+    with pdfplumber.open(pdf_path) as pdf:
+        for p, page in enumerate(pdf.pages):
+            # Get all characters with their properties
+            chars = page.chars or []
+            if not chars:
+                continue
+                
+            # Group characters into words first
+            words = page.extract_words(
+                x_tolerance=2, y_tolerance=2, use_text_flow=True, keep_blank_chars=False
+            ) or []
+            
+            # Remove words inside occupied regions
+            occ = [_expand(b, 1.5) for b in occupied_masks.get(p, [])]
+            keep_words = []
+            for w in words:
+                wb = (w["x0"], w["top"], w["x1"], w["bottom"])
+                if any(_iou(wb, b) > 0.05 for b in occ):
+                    continue
+                keep_words.append(w)
+            
+            if not keep_words:
+                continue
+            
+            # Sort words by position (top to bottom, left to right)
+            keep_words.sort(key=lambda w: (w["top"], w["x0"]))
+            
+            # Group words into logical text blocks
+            text_blocks = []
+            current_block = []
+            
+            for word in keep_words:
+                # Check if this word should start a new block
+                if current_block:
+                    last_word = current_block[-1]
+                    
+                    # Check if we should continue the current block
+                    vertical_gap = word["top"] - last_word["bottom"]
+                    horizontal_overlap = _horiz_overlap(
+                        (word["x0"], word["top"], word["x1"], word["bottom"]),
+                        (last_word["x0"], last_word["top"], last_word["x1"], last_word["bottom"])
+                    )
+                    
+                    # Continue block if: small vertical gap, horizontal overlap, similar formatting
+                    font_similar = word.get("fontname", "") == last_word.get("fontname", "")
+                    size_similar = abs(word.get("size", 0) - last_word.get("size", 0)) < 1
+                    reasonable_gap = vertical_gap < 15  # Allow larger gaps for paragraph breaks
+                    
+                    if reasonable_gap and (horizontal_overlap > 0 or font_similar and size_similar):
+                        current_block.append(word)
+                    else:
+                        # End current block and start new one
+                        if current_block:
+                            text_blocks.append(_create_text_block(current_block, p, len(text_blocks)))
+                        current_block = [word]
+                else:
+                    current_block = [word]
+            
+            # Don't forget the last block
+            if current_block:
+                text_blocks.append(_create_text_block(current_block, p, len(text_blocks)))
+            
+            txt_by_page[p] = text_blocks
+    
+    return txt_by_page
+
+def _create_text_block(words: List[Dict], page_num: int, block_index: int) -> ElementDict:
+    """Create a text block element from a list of words."""
+    if not words:
+        return {}
+    
+    # Extract all text content
+    text_content = " ".join(w["text"] for w in words)
+    
+    # Calculate bounding box
+    x0 = min(w["x0"] for w in words)
+    y0 = min(w["top"] for w in words)
+    x1 = max(w["x1"] for w in words)
+    y1 = max(w["bottom"] for w in words)
+    
+    # Determine if this is a heading based on font size and position
+    font_sizes = [w.get("size", 0) for w in words]
+    avg_font_size = sum(font_sizes) / len(font_sizes) if font_sizes else 0
+    
+    # Check if this appears to be a heading (larger font, possibly centered)
+    is_heading = False
+    if avg_font_size > 12:  # Larger than typical body text
+        # Check if it's centered or positioned differently
+        page_width = words[0].get("page_width", 612)  # Default page width
+        block_center = (x0 + x1) / 2
+        page_center = page_width / 2
+        if abs(block_center - page_center) < 50:  # Roughly centered
+            is_heading = True
+    
+    # Get dominant font properties
+    fonts = [w.get("fontname", "") for w in words]
+    dominant_font = max(set(fonts), key=fonts.count) if fonts else ""
+    
+    return {
+        "id": f"text_p{page_num}_{block_index}",
+        "kind": "text",
+        "page_range": (page_num, page_num),
+        "bboxes_per_page": [{"page": page_num, "bbox": (x0, y0, x1, y1)}],
+        "metadata": {
+            "font": dominant_font,
+            "font_size": avg_font_size,
+            "is_heading": is_heading,
+            "word_count": len(words),
+            "column_span": None
+        },
+        "text": text_content
+    }
+
+
+# -----------------------------
+# Stitching across pages
+# -----------------------------
+def _stitch_text_across_pages(text_by_page: Dict[int, List[ElementDict]],
+                              page_sizes: List[Tuple[float, float]],
+                              top_tol: float = 24.0,
+                              bottom_tol: float = 24.0,
+                              edge_tol: float = 8.0) -> List[ElementDict]:
+    """
+    Merge text elements that likely continue across page breaks:
+    - block ends near bottom of page p and next block starts near top of page p+1
+    - left/right edges align within edge_tol
+    """
+    stitched: List[ElementDict] = []
+    # Index by page
+    max_page = max(text_by_page.keys(), default=-1)
+    visited = set()
+
+    for p in range(max_page + 1):
+        for i, el in enumerate(text_by_page.get(p, [])):
+            if (p, i) in visited:
+                continue
+            chain = [el]
+            # attempt to follow onto next pages
+            curr = el
+            cp_end = curr["bboxes_per_page"][-1]["bbox"]
+            while True:
+                np = curr["page_range"][1] + 1
+                if np not in text_by_page:
+                    break
+                H_next = page_sizes[np][1] if np < len(page_sizes) else None
+                if H_next is None:
+                    break
+                candidates = text_by_page[np]
+                # bottom near page end?
+                if (page_sizes[curr["page_range"][1]][1] - cp_end[3]) > bottom_tol:
+                    break
+                # find top-near candidates
+                top_cands = []
+                for j, nxt in enumerate(candidates):
+                    nb = nxt["bboxes_per_page"][0]["bbox"]
+                    if nb[1] > top_tol:
+                        continue
+                    # edge alignment
+                    if _nearly_equal(cp_end[0], nb[0], edge_tol) or _nearly_equal(cp_end[2], nb[2], edge_tol):
+                        top_cands.append((j, nxt))
+                if not top_cands:
+                    break
+                # take the first reasonably aligned candidate (greedy)
+                j, nxt = top_cands[0]
+                chain.append(nxt)
+                visited.add((np, j))
+                curr = nxt
+                cp_end = curr["bboxes_per_page"][-1]["bbox"]
+
+            # merge chain into one element
+            if len(chain) == 1:
+                stitched.append(chain[0])
+            else:
+                start_p = chain[0]["page_range"][0]
+                end_p = chain[-1]["page_range"][1]
+                bpps: List[PageBBox] = []
+                for node in chain:
+                    bpps.extend(node["bboxes_per_page"])
+                merged: ElementDict = {
+                    "id": f"text_p{start_p}-{end_p}_{len(stitched)}",
+                    "kind": "text",
+                    "page_range": (start_p, end_p),
+                    "bboxes_per_page": bpps,
+                    "metadata": {"stitched_pages": len(chain)},
+                }
+                stitched.append(merged)
+
+    return stitched
+
+
+def _stitch_tables_across_pages(tables_by_page: Dict[int, List[ElementDict]],
+                                page_sizes: List[Tuple[float, float]],
+                                edge_tol: float = 8.0) -> List[ElementDict]:
+    """
+    Merge tables that continue across pages by comparing column edges and vertical proximity to page boundaries.
+    For Camelot detections, we rely on bbox alignment; header text/structure can be added when available.
+    """
+    stitched: List[ElementDict] = []
+    visited = set()
+    max_page = max(tables_by_page.keys(), default=-1)
+
+    def col_signature(b: BBox, n_bins: int = 6) -> Tuple[int, int]:
+        # crude proxy: quantize left/right to bins across page width to compare alignment
+        x0, _, x1, _ = b
+        return (round(x0 / 10), round(x1 / 10))
+
+    for p in range(max_page + 1):
+        arr = tables_by_page.get(p, [])
+        for i, el in enumerate(arr):
+            if (p, i) in visited:
+                continue
+            chain = [el]
+            curr = el
+            while True:
+                np = curr["page_range"][1] + 1
+                if np not in tables_by_page:
+                    break
+                # current ends near bottom?
+                cb = curr["bboxes_per_page"][-1]["bbox"]
+                page_h = page_sizes[curr["page_range"][1]][1] if curr["page_range"][1] < len(page_sizes) else None
+                if page_h is None or (page_h - cb[3]) > 28.0:
+                    break
+                # find next page table whose left/right edges roughly align
+                sig = col_signature(cb)
+                found = None
+                for j, cand in enumerate(tables_by_page[np]):
+                    nb = cand["bboxes_per_page"][0]["bbox"]
+                    if nb[1] > 36.0:  # should start near top
+                        continue
+                    if col_signature(nb) == sig or _nearly_equal(cb[0], nb[0], edge_tol) and _nearly_equal(cb[2], nb[2], edge_tol):
+                        found = (np, j, cand); break
+                if not found:
+                    break
+                npg, j, cand = found
+                chain.append(cand)
+                visited.add((npg, j))
+                curr = cand
+
+            if len(chain) == 1:
+                stitched.append(chain[0])
+            else:
+                start_p = chain[0]["page_range"][0]
+                end_p = chain[-1]["page_range"][1]
+                bpps: List[PageBBox] = []
+                for node in chain:
+                    bpps.extend(node["bboxes_per_page"])
+                merged: ElementDict = {
+                    "id": f"table_p{start_p}-{end_p}_{len(stitched)}",
+                    "kind": "table",
+                    "page_range": (start_p, end_p),
+                    "bboxes_per_page": bpps,
+                    "metadata": {"stitched_pages": len(chain)},
+                }
+                stitched.append(merged)
+
+    return stitched
+
+
+# -----------------------------
+# Public API
+# -----------------------------
 @dataclass
 class DigitalElementClassifier:
-    """Locate simple elements within a digital PDF, treating it as one document."""
 
     def classify(self, pdf_path: str) -> ElementType:
-
-        """Return a dictionary describing all element types in the PDF.
-
-        Contains the keys ``text``, ``tables`` and ``images`` with
-        metadata describing the location of each element. The goal is merely to
+        """
+        Return a dictionary describing all element types in the PDF.
+        Contains the keys ``text``, ``tables`` and ``images`` with metadata
+        describing the location of each element. The goal is merely to
         identify their presence; detailed processing is delegated elsewhere.
         """
-        all_text = []
-        all_tables = []
-        all_images = []
+        # 1) Detect tables and images per page
+        tables_by_page = _detect_table_regions(pdf_path)
+        images_by_page = _detect_images(pdf_path, save_images=True)
 
+        # Build occupied masks to avoid overlapping text classification
+        occupied_masks: Dict[int, List[BBox]] = {}
+        for p, arr in tables_by_page.items():
+            for el in arr:
+                occupied_masks.setdefault(p, []).append(el["bboxes_per_page"][0]["bbox"])
+        for p, arr in images_by_page.items():
+            for el in arr:
+                occupied_masks.setdefault(p, []).append(el["bboxes_per_page"][0]["bbox"])
+
+        # 2) Text blocks from remaining regions
+        text_by_page = _extract_all_text_blocks(pdf_path, occupied_masks)
+
+        # 3) Page sizes for stitching
+        page_sizes: List[Tuple[float, float]] = []
         with pdfplumber.open(pdf_path) as pdf:
-            # Process all pages as one continuous document
-            for page in pdf.pages:
-                all_text.extend(self._extract_text_blocks(page))
-                all_tables.extend(self._extract_tables(page))
-                all_images.extend(self._extract_images(page))
+            page_sizes = [(pg.width, pg.height) for pg in pdf.pages]
 
-        # Now we could potentially merge text blocks that span page boundaries
-        # by checking if they have similar formatting and are positioned near page edges
-        all_text = self._merge_cross_page_text_blocks(all_text)
+        # 4) Stitch across pages
+        all_tables = _stitch_tables_across_pages(tables_by_page, page_sizes)
+        # Add any unstitched tables (pages with no stitching step)
+        stitched_ids = {(el["id"], el["page_range"]) for el in all_tables}
+        for p, arr in tables_by_page.items():
+            for el in arr:
+                # identify unique by bbox+page_range if ID differs
+                key = (el["id"], el["page_range"])
+                if key not in stitched_ids:
+                    all_tables.append(el)
+
+        all_text = _stitch_text_across_pages(text_by_page, page_sizes)
+        stitched_text_keys = {(tuple(x["page_range"]), tuple((bp["page"], *bp["bbox"]) for bp in x["bboxes_per_page"])) for x in all_text}
+        for p, arr in text_by_page.items():
+            for el in arr:
+                key = (tuple(el["page_range"]), tuple((bp["page"], *bp["bbox"]) for bp in el["bboxes_per_page"]))
+                if key not in stitched_text_keys:
+                    all_text.append(el)
+
+        # Images rarely stitch; flatten to list
+        all_images: List[ElementDict] = []
+        for p, arr in images_by_page.items():
+            all_images.extend(arr)
+
+        # Stable sort by page range then x,y for readability
+        def page_key(e: ElementDict) -> Tuple[int, float, float]:
+            pg = e["page_range"][0]
+            b0 = e["bboxes_per_page"][0]["bbox"]
+            return (pg, b0[1], b0[0])
+
+        all_text.sort(key=page_key)
+        all_tables.sort(key=page_key)
+        all_images.sort(key=page_key)
 
         return {
             "text": all_text,
             "tables": all_tables,
             "images": all_images,
         }
-
-    def _extract_text_blocks(self, page: Page) -> List[Dict[str, Any]]:
-        """Extract cohesive text blocks using character-level information."""
-        chars = page.chars
-        
-        if not chars:
-            return []
-        
-        # Sort characters by position (top to bottom, left to right)
-        sorted_chars = sorted(chars, key=lambda c: (c['top'], c['x0']))
-        
-        text_blocks = []
-        current_block = []
-        
-        for char in sorted_chars:
-            # Skip non-printable characters
-            if not char.get('text', '').strip():
-                continue
-                
-            char_info = {
-                'text': char.get('text', ''),
-                'font': char.get('fontname', ''),
-                'size': char.get('size', 0),
-                'x0': char.get('x0', 0),
-                'y0': char.get('top', 0),
-                'x1': char.get('x1', 0),
-                'y1': char.get('bottom', 0),
-                'bbox': (char.get('x0', 0), char.get('top', 0), char.get('x1', 0), char.get('bottom', 0))
-            }
-            
-            # Group characters that are close together and have similar formatting
-            if current_block and self._should_group_char(current_block[-1], char_info):
-                current_block.append(char_info)
-            else:
-                if current_block:
-                    text_blocks.append(self._merge_text_block(current_block))
-                current_block = [char_info]
-        
-        # Don't forget the last block
-        if current_block:
-            text_blocks.append(self._merge_text_block(current_block))
-            
-        return text_blocks
-
-    def _should_group_char(self, prev_char: Dict, curr_char: Dict) -> bool:
-        """Determine if two characters should be grouped together."""
-        # Group if they're within reasonable distance and have similar formatting
-        vertical_gap = abs(curr_char['y0'] - prev_char['y0'])
-        horizontal_gap = curr_char['x0'] - prev_char['x1']
-        
-        # Allow some tolerance for line breaks and spacing
-        same_line = vertical_gap < 5  # Same line
-        next_line = 5 <= vertical_gap < 25  # Next line (reasonable line height)
-        
-        # Check if the horizontal gap suggests a word boundary
-        # If characters are too far apart horizontally, they're likely different words
-        char_width = prev_char['x1'] - prev_char['x0']
-        reasonable_spacing = horizontal_gap < max(15, char_width * 2.5)  # More conservative spacing
-        
-        font_similar = prev_char['font'] == curr_char['font']
-        size_similar = abs(prev_char['size'] - curr_char['size']) < 1
-        
-        return (same_line or (next_line and reasonable_spacing)) and font_similar and size_similar
-
-    def _merge_text_block(self, chars: List[Dict]) -> Dict[str, Any]:
-        """Merge multiple characters into a single text block."""
-        if not chars:
-            return {}
-            
-        # Combine all text, preserving spaces by using the original spacing
-        combined_text = self._reconstruct_text_with_spaces(chars)
-        
-        # Post-process the text to fix common spacing issues
-        combined_text = self._fix_common_spacing_issues(combined_text)
-        
-        # Calculate bounding box
-        x0 = min(char['x0'] for char in chars)
-        y0 = min(char['y0'] for char in chars)
-        x1 = max(char['x1'] for char in chars)
-        y1 = max(char['y1'] for char in chars)
-        
-        # Use the most common font and size
-        fonts = [char['font'] for char in chars]
-        sizes = [char['size'] for char in chars]
-        dominant_font = max(set(fonts), key=fonts.count) if fonts else ''
-        dominant_size = max(set(sizes), key=sizes.count) if sizes else 0
-        
-        return {
-            'text': combined_text,
-            'bbox': (x0, y0, x1, y1),
-            'font': dominant_font,
-            'size': dominant_size,
-            'x0': x0,
-            'y0': y0,
-            'x1': x1,
-            'y1': y1,
-            'char_count': len(chars)
-        }
-
-    def _reconstruct_text_with_spaces(self, chars: List[Dict]) -> str:
-        """Reconstruct text with proper spacing based on character positions."""
-        if not chars:
-            return ""
-        
-        # Sort characters by position (left to right, top to bottom)
-        sorted_chars = sorted(chars, key=lambda c: (c['y0'], c['x0']))
-        
-        result = []
-        prev_char = None
-        
-        for char in sorted_chars:
-            if prev_char is None:
-                result.append(char['text'])
-            else:
-                # Check if we need to add a space
-                vertical_gap = abs(char['y0'] - prev_char['y0'])
-                horizontal_gap = char['x0'] - prev_char['x1']
-                
-                # Add space if characters are far apart horizontally on the same line
-                # Use a more intelligent threshold based on character width
-                if vertical_gap < 5:  # Same line
-                    char_width = prev_char['x1'] - prev_char['x0']
-                    # If gap is significantly larger than typical character spacing, add space
-                    if horizontal_gap > max(3, char_width * 1.2):
-                        result.append(' ')
-                else:
-                    # New line - add newline
-                    result.append('\n')
-                
-                result.append(char['text'])
-            
-            prev_char = char
-        
-        return ''.join(result)
-
-    def _fix_common_spacing_issues(self, text: str) -> str:
-        """Fix common spacing issues in extracted text."""
-        if not text:
-            return text
-        
-        # Fix common patterns where spaces are missing
-        import re
-        
-        # Add spaces before capital letters that follow lowercase letters (word boundaries)
-        text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
-        
-        # Add spaces before numbers that follow letters
-        text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)
-        
-        # Add spaces after numbers that are followed by letters
-        text = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', text)
-        
-        # Fix common abbreviations and patterns
-        text = re.sub(r'([a-z])(\()', r'\1 \2', text)  # Space before opening parenthesis
-        text = re.sub(r'(\))([a-zA-Z])', r'\1 \2', text)  # Space after closing parenthesis
-        
-        # Fix common PDF extraction issues
-        text = re.sub(r'([a-z])(\()', r'\1 \2', text)  # Space before opening bracket
-        text = re.sub(r'(\])([a-zA-Z])', r'\1 \2', text)  # Space after closing bracket
-        
-        # Fix spacing around punctuation
-        text = re.sub(r'([a-zA-Z])([,;:])', r'\1 \2', text)  # Space before punctuation
-        text = re.sub(r'([,;:])([a-zA-Z])', r'\1 \2', text)  # Space after punctuation
-        
-        # Fix common word boundary issues
-        text = re.sub(r'([a-z])([A-Z][a-z])', r'\1 \2', text)  # Better word boundary detection
-        
-        # Fix multiple spaces
-        text = re.sub(r' +', ' ', text)
-        
-        # Fix spaces around newlines
-        text = re.sub(r' *\n *', '\n', text)
-        
-        # Fix common PDF ligatures and character issues
-        text = text.replace('ﬁ', 'fi').replace('ﬂ', 'fl').replace('ﬀ', 'ff')
-        
-        return text.strip()
-
-    def _merge_cross_page_text_blocks(self, text_blocks: List[Dict]) -> List[Dict]:
-        """Attempt to merge text blocks that might span page boundaries."""
-        if not text_blocks:
-            return text_blocks
-            
-        # Sort by position (assuming we can determine relative positioning across pages)
-        # This is a simplified approach - you might want more sophisticated logic
-        sorted_blocks = sorted(text_blocks, key=lambda b: (b['y0'], b['x0']))
-        
-        merged_blocks = []
-        current_block = None
-        
-        for block in sorted_blocks:
-            if current_block is None:
-                current_block = block
-            else:
-                # Check if this block should be merged with the current one
-                if self._should_merge_blocks(current_block, block):
-                    current_block = self._merge_two_blocks(current_block, block)
-                else:
-                    merged_blocks.append(current_block)
-                    current_block = block
-        
-        if current_block:
-            merged_blocks.append(current_block)
-            
-        return merged_blocks
-
-    def _should_merge_blocks(self, block1: Dict, block2: Dict) -> bool:
-        """Determine if two text blocks should be merged (e.g., spanning page boundaries)."""
-        # Check if they have similar formatting
-        font_similar = block1['font'] == block2['font']
-        size_similar = abs(block1['size'] - block2['size']) < 1
-        
-        # Check if they're positioned logically (this is where you'd implement
-        # cross-page boundary detection)
-        # For now, just check formatting similarity
-        return font_similar and size_similar
-
-    def _merge_two_blocks(self, block1: Dict, block2: Dict) -> Dict:
-        """Merge two text blocks into one."""
-        combined_text = block1['text'] + '\n' + block2['text']
-        
-        # Calculate combined bounding box
-        x0 = min(block1['x0'], block2['x0'])
-        y0 = min(block1['y0'], block2['y0'])
-        x1 = max(block1['x1'], block2['x1'])
-        y1 = max(block1['y1'], block2['y1'])
-        
-        return {
-            'text': combined_text,
-            'bbox': (x0, y0, x1, y1),
-            'font': block1['font'],  # Use the first block's font
-            'size': block1['size'],  # Use the first block's size
-            'x0': x0,
-            'y0': y0,
-            'x1': x1,
-            'y1': y1,
-            'char_count': block1['char_count'] + block2['char_count']
-        }
-
-    def _extract_tables(self, page: Page) -> List[Dict[str, Any]]:
-        """Extract table information with more metadata."""
-        tables = []
-        for table in page.find_tables():
-            table_info = {
-                'bbox': table.bbox,
-                'rows': len(table.rows),
-                'cols': len(table.rows[0]) if table.rows else 0,
-                'extracted_text': table.extract()
-            }
-            tables.append(table_info)
-        return tables
-
-    def _extract_images(self, page: Page) -> List[Dict[str, Any]]:
-        """Extract image information with positioning data."""
-        images = []
-        for img in page.images:
-            # Fix the bbox extraction - page.images might not have bbox
-            # Try to get position from the image object itself
-            if hasattr(img, 'bbox') and img.bbox:
-                bbox = img.bbox
-            else:
-                # Fallback: try to get position from page layout
-                bbox = (0, 0, img.get('width', 0), img.get('height', 0))
-            
-            img_info = {
-                'bbox': bbox,
-                'width': img.get('width', 0),
-                'height': img.get('height', 0),
-                'type': img.get('type', 'unknown'),
-                'x0': bbox[0],
-                'y0': bbox[1],
-                'x1': bbox[2],
-                'y1': bbox[3]
-            }
-            images.append(img_info)
-        return images
