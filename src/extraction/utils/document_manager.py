@@ -249,6 +249,8 @@ class DocumentManager:
     def process_from_unprocessed(self, unprocessed_dir: str = "data/unprocessed_documents") -> List[str]:
         """
         Process all PDFs from the unprocessed documents directory.
+        Documents that already have a corresponding folder in the
+        processed documents directory will be skipped.
         
         Args:
             unprocessed_dir: Path to directory containing unprocessed PDFs
@@ -273,17 +275,22 @@ class DocumentManager:
         print(f"🔍 Found {len(pdf_files)} PDF files to process")
         
         for pdf_file in pdf_files:
-            # Create document ID from filename (remove .pdf extension)
+            # Use the PDF filename (without extension) as the document ID
             pdf_name = Path(pdf_file).stem
-            document_id = f"{pdf_name}_{int(datetime.now().timestamp())}"
-            
+            document_id = pdf_name
+
+            # Skip processing if a document with this ID already exists
+            if self.data_settings.get_document_path(document_id).exists():
+                print(f"⏭️  Skipping already processed document: {document_id}")
+                continue
+
             print(f"\n📋 Processing: {pdf_name}")
             print(f"🆔 Document ID: {document_id}")
-            
+
             # Create document structure and copy PDF
             doc_path = self.create_document(document_id, pdf_file)
             processed_docs.append(document_id)
-            
+
             print(f"✅ Document structure created at: {doc_path}")
         
         return processed_docs
